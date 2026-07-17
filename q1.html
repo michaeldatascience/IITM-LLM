@@ -687,6 +687,44 @@ def multi_head_attention(H, heads, Wo, causal=False):
     </div>
   </details>
 
+  <h3>From scratch — the component counter</h3>
+<pre><code>def mha_params(d_model, n_h, bias=False):
+    """All heads together. n_h cancels: n_h * d_model * (d_model/n_h) = d_model^2."""
+    d_k = d_model // n_h
+    qkv = 3 * n_h * (d_model * d_k)      # == 3 * d_model**2
+    w_o = d_model * d_model              # ONE W_O per layer, never per head
+    p   = qkv + w_o                      # == 4 * d_model**2
+    if bias:
+        p += 4 * d_model                 # one bias per output neuron, x4 matrices
+    return p
+
+def ffn_params(d_model, d_ff, bias=False):
+    p = 2 * d_model * d_ff
+    if bias:
+        p += d_ff + d_model              # b1 is d_ff, b2 is d_model
+    return p
+
+def ln_params(d_model):
+    return 2 * d_model                   # gamma + beta. NEVER times T.
+
+def encoder_layer(d_model, n_h, d_ff, bias=False):
+    return mha_params(d_model, n_h, bias) + ffn_params(d_model, d_ff, bias) \
+         + 2 * ln_params(d_model)        # 2 sublayers -> 2 LNs
+
+def decoder_layer(d_model, n_h, d_ff, bias=False):
+    return 2 * mha_params(d_model, n_h, bias) + ffn_params(d_model, d_ff, bias) \
+         + 3 * ln_params(d_model)        # masked MHA + cross MHA + FFN -> 3 LNs
+
+# GA2: d_model=64, n_h=4, d_ff=256, N=2, no bias in FFN
+enc, dec = encoder_layer(64, 4, 256), decoder_layer(64, 4, 256)
+print(enc, dec)                          # 49408 65920
+print(2 * (enc + dec))                   # 230656   <- the official GA2 answer
+
+# The output layer and embeddings, which GA2 asked separately
+print(1500 * 64)                         # 96000  output layer, no bias
+print(1500 * 64 + 1500)                  # 97500  output layer, with bias
+print(1000 * 64)                         # 64000  input embedding = |V_s| * d_model</code></pre>
+
   <h3>Sublayer counting: the 2 vs 3 rule</h3>
   <p>Each sublayer is wrapped as <span class="mono">LayerNorm(x + Sublayer(x))</span>. So <strong>#LayerNorms = #sublayers</strong>.</p>
   <ul>
@@ -1217,6 +1255,34 @@ print(round(sum(y), 6))                           # 4.0  — always H*beta</code
 
   <p><strong>The reconciliation:</strong> $n_h \times 147{,}456 = 12 \times 147{,}456 = 1{,}769{,}472 = 3\times768^2$ ✓ — the per-head counts sum to the "all heads" count. Nothing is inconsistent; only the question's scope changes.</p>
 
+  <details class="bg">
+    <summary>Background — why $d_k = d_{model}/n_h$, and why multi-head is nearly free</summary>
+    <div class="body">
+      <p>Nothing <em>forces</em> $d_k = d_{model}/n_h$. You could give every head the full $d_{model}$. The reason the Transformer divides is <strong>compute neutrality</strong>.</p>
+      <p>With $n_h$ heads each of width $d_k = d_{model}/n_h$:</p>
+      $$\text{params}(W_Q\text{, all heads}) = n_h \times (d_{model} \times d_k) = n_h \times d_{model} \times \frac{d_{model}}{n_h} = d_{model}^2$$
+      <p>The $n_h$ <strong>cancels</strong>. Eight heads of width 64 cost exactly what one head of width 512 costs. So multi-head attention buys you eight independent representation subspaces for <em>zero</em> extra parameters and (roughly) zero extra FLOPs. That is an unusually good deal, and it's why the paper says the cost is "similar to that of single-head attention with full dimensionality."</p>
+      <p><strong>This cancellation is exactly why the "for a given head" trap works.</strong> $d_{model}d_k$ and $d_{model}^2$ differ by a factor of $n_h$, and both are legitimate answers to differently-scoped questions. The keyed PYQ pair — 32,768 and 589,824 — sit on opposite sides of this identity.</p>
+      <p><strong>The keyed MSQ follows directly:</strong> "increasing $n_h$ while keeping $d_{model}$ fixed decreases the dimensionality handled by each head" ✓ (that's the division). And "they reduce memory usage compared to one head" ✗ — memory for <em>scores</em> is $h\cdot T^2$, which <em>grows</em> with $h$. Params stay flat; activations don't. Those are different budgets and the distractor conflates them.</p>
+    </div>
+  </details>
+
+  <details class="bg">
+    <summary>Background — the $O(T^2)$ wall, in numbers</summary>
+    <div class="body">
+      <p>Parameters are independent of $T$. Attention <em>activations</em> are not — they scale as $T^2$, and this is the single dominant practical constraint on context length.</p>
+      <table>
+        <tr><th class="mono">T</th><th class="mono">scores/head/seq</th><th class="mono">float32 memory (B=32, h=12)</th></tr>
+        <tr><td class="mono">512</td><td class="mono">262,144</td><td class="mono">403 MB</td></tr>
+        <tr><td class="mono">1,024</td><td class="mono">1,048,576</td><td class="mono">1.6 GB</td></tr>
+        <tr><td class="mono">4,096</td><td class="mono">16,777,216</td><td class="mono">25.8 GB</td></tr>
+        <tr><td class="mono">32,768</td><td class="mono">1,073,741,824</td><td class="mono">1,650 GB</td></tr>
+      </table>
+      <p>Doubling $T$ <strong>quadruples</strong> the memory. That table is why 2017-era models capped at 512 tokens, and why long-context work is almost entirely about not materialising the $T\times T$ matrix (FlashAttention tiles it; sparse/linear attention approximates it).</p>
+      <p>Note the exam's memory question is the same arithmetic with $h$ as the variable instead of $T$ — and doubling $h$ only <em>doubles</em> memory (linear), while doubling $T$ quadruples it (quadratic). <strong>Know which variable you're differentiating with respect to.</strong></p>
+    </div>
+  </details>
+
   <h3>The activation ledger</h3>
   <table>
     <tr><th>Quantity</th><th>Formula</th><th>Reasoning</th></tr>
@@ -1439,6 +1505,35 @@ print(a['targets'], a['nonzero'])                                 # 32736 524800
     <p>(Key range 3.3–3.5 ✓. The alternative range 1.7–1.8 the grader also accepted is the <em>average</em> loss, $3.4358/2 = 1.72$ — they hedged on sum vs mean. <strong>Default to sum</strong>; the question said "total loss".)</p>
   </div>
 
+  <h3>From scratch</h3>
+<pre><code>VOCAB = ['[CLS]','building','character','a','is','astronomy',
+         'science','experience','natural','[SEP]']
+
+def mlm_loss(Y_hat, true_tokens, masked_positions, reduce='sum'):
+    """Y_hat[t] = predicted distribution at position t.
+       true_tokens[t] = the actual word at position t (string).
+       masked_positions = list of t that were replaced by [Mask]."""
+    losses = []
+    for t in masked_positions:
+        idx = VOCAB.index(true_tokens[t])       # the TRUE word's column...
+        p   = Y_hat[t][idx]                     # ...not the argmax!
+        losses.append(-math.log(p))
+    return sum(losses) if reduce == 'sum' else sum(losses) / len(losses)
+
+Y = [[0.05,0.02,0.41,0.07,0.09,0.14,0.08,0.05,0.08,0.01],
+     [0.10,0.04,0.06,0.16,0.04,0.01,0.06,0.09,0.01,0.43],
+     [0.05,0.07,0.28,0.03,0.29,0.08,0.04,0.08,0.04,0.04],
+     [0.10,0.02,0.14,0.02,0.01,0.07,0.06,0.48,0.07,0.01],
+     [0.08,0.29,0.04,0.01,0.04,0.03,0.25,0.05,0.15,0.06],
+     [0.14,0.13,0.22,0.08,0.01,0.03,0.06,0.23,0.08,0.03]]
+
+sentence = ['astronomy','is','a','character','building','experience']
+print(round(mlm_loss(Y, sentence, [3, 5]), 4))          # 3.4358  <- GA4 answer
+print(round(mlm_loss(Y, sentence, [3, 5], 'mean'), 4))  # 1.7179  (the 'mean' variant)
+
+# Proof that the argmax is a red herring at position 3:
+print(VOCAB[Y[3].index(max(Y[3]))], 'vs true:', sentence[3])   # experience vs character</code></pre>
+
   <h3>Using BERT downstream</h3>
   <table>
     <tr><th>Mode</th><th>What happens</th></tr>
@@ -1505,6 +1600,16 @@ print(a['targets'], a['nonzero'])                                 # 32736 524800
 
   <div class="callout"><strong>The keyed MSQ: "which decoding strategies are inherently non-deterministic?"</strong> → <strong>Nucleus</strong> (and top-$k$, if offered). Greedy, beam, and exhaustive all take argmaxes — run them twice, get the same output. Only the <em>sampling</em> methods roll a die. <strong>"Top-$k$" and "beam size $k$" both restrict to $k$ candidates and are constantly confused: beam <em>keeps</em> all $k$ and continues them; top-$k$ <em>samples one</em> from among them and discards the rest.</strong></div>
 
+  <details class="bg">
+    <summary>Background — why beam search isn't optimal, and why nobody cares</summary>
+    <div class="body">
+      <p><strong>Beam search is a heuristic, not an algorithm that finds the best sequence.</strong> It can miss the true $\arg\max$ trivially: a sequence whose first token ranks 4th but whose continuation is overwhelmingly good gets pruned at step 1 and never recovers. Beam search has no way back.</p>
+      <p><strong>The length bias.</strong> $P(y_1,\dots,y_T) = \prod_t P(y_t\mid y_{<t})$ is a product of numbers below 1, so it <em>always</em> shrinks as $T$ grows. A 5-word sequence will beat a 20-word sequence on raw probability essentially every time. Left alone, beam search produces absurdly short output. The standard patch is length normalisation — score by $\frac{1}{T^\alpha}\log P$ instead of $P$ — which is a hack with a tuned $\alpha$, not a principle.</p>
+      <p><strong>The deeper joke:</strong> Holtzman et al. (2019) showed that the <em>actual</em> maximum-likelihood sequence is often terrible — degenerate, repetitive text ("I don't know. I don't know. I don't know."). Human language is not the most probable thing a language model can say; it has a characteristic amount of surprise in it. So beam search failing to find the global optimum is arguably a <em>feature</em>. This is the real argument for sampling: we're not approximating $\arg\max$ badly, we've decided $\arg\max$ was the wrong target.</p>
+      <p>For the exam: know that greedy is beam with $k=1$, and that beam with $k=|V|^T$ is exhaustive. The three strategies are one family with the beam width dialled from 1 to everything.</p>
+    </div>
+  </details>
+
   <h3>Counting: greedy vs beam vs exhaustive</h3>
   <p>This is asked numerically on two of three papers. Get the mental model right and it's mechanical.</p>
 
@@ -1543,6 +1648,17 @@ print(a['targets'], a['nonzero'])                                 # 32736 524800
     $$V^{L+1} - V^L = V^L(V-1) = \boxed{(V-1)\cdot V^L}\;✓$$
     <p>Read "additional" as a difference, not a total. Every one of the $V^L$ existing sequences spawns $V$ children, of which... no — cleanest: new total minus old total.</p>
   </div>
+
+  <details class="bg">
+    <summary>Background — the chain rule here is exact, not an approximation</summary>
+    <div class="body">
+      <p>$P(y_1,\dots,y_T) = \prod_{t=1}^{T}P(y_t\mid y_{<t})$ involves <strong>no independence assumption whatsoever</strong>. It's the definition of conditional probability applied $T-1$ times:</p>
+      $$P(A,B,C) = P(A)\,P(B\mid A)\,P(C\mid A,B)$$
+      <p>This matters because students often half-remember "Markov assumption" from n-gram models and think something is being approximated. Nothing is. The <em>n-gram</em> model approximates ($P(y_t\mid y_{<t}) \approx P(y_t \mid y_{t-1})$); the Transformer does not — it conditions on the entire prefix, which is exactly what the causal mask permits.</p>
+      <p><strong>This is the whole architectural argument for CLM.</strong> Factorising the joint distribution over sequences into next-token conditionals is <em>exact</em>, and each conditional is something a neural net can learn. That's why "predict the next word" is not a toy objective — it is a complete, lossless decomposition of the problem of modelling language.</p>
+      <p>Practical note: in code you'd sum $\log P$ rather than multiply $P$, because 20 factors below 1 underflow float32 fast. The exam's sequences are short enough that the product is fine.</p>
+    </div>
+  </details>
 
   <h3>Sequence probability</h3>
   <p>By the chain rule (exact, no assumption):</p>
@@ -1751,6 +1867,23 @@ print(round(sequence_prob(Y, [5,4,3,2,1,7]), 4))       # 0.0016</code></pre>
 
   <div class="callout"><strong>Be honest about what happened there:</strong> a column-wise softmax means the attention weights <em>for a given query</em> do not sum to 1 — head 1's output row of $[6,12] = v_1 + v_2$ with weights $[1,1]$ is not a convex combination, which the standard formulation guarantees. So the setter's formula and key are non-standard. <strong>That does not help you in the exam.</strong> The practical rule: <em>compute the standard way first; if your answer isn't among the options, transpose the softmax axis and try again.</em> On MCQ this costs 60 seconds and it is always recoverable. The tell that you're in this situation: an option with a row of zeros, or values that are clearly not weighted averages of the $v_j$.</div>
 
+  <details class="bg">
+    <summary>Background — why two conventions exist at all, and how to never be confused again</summary>
+    <div class="body">
+      <p>This isn't the course being sloppy; it's two genuine traditions colliding.</p>
+      <p><strong>Mathematics and physics write vectors as columns.</strong> A linear map is $y = Ax$ — operator on the left, acted-on thing on the right. Composition reads right-to-left: $CBAx$. Every linear algebra textbook you've met does this.</p>
+      <p><strong>Deep learning frameworks write data as rows.</strong> A batch is stored as <span class="mono">(n_samples, n_features)</span> because that's how you'd store a CSV, and because iterating over the first axis should give you samples. So the natural expression is $Y = XW$ — data on the left, weights on the right. Composition reads left-to-right: $XW_1W_2$, which matches the order you'd write the layers.</p>
+      <p>The two are exact transposes: $(XW)^\top = W^\top X^\top$. Neither is wrong. Papers written by people from a maths background use columns; code written against PyTorch uses rows; lecture slides mix them depending on who made the slide.</p>
+      <p><strong>The permanent fix — three questions, in this order:</strong></p>
+      <ol>
+        <li><strong>Where is $d_{model}$?</strong> Find the given dimension in the given matrix's shape. If $X$ is $T\times d_{model}$ you're in row world; if $d_{model}\times T$, column world.</li>
+        <li><strong>Which product type-checks?</strong> Try both $XW$ and $WX$. Usually exactly one produces something with a $T$ axis and a $d_k$ axis. That one is right.</li>
+        <li><strong>Does the score matrix come out $T\times T$?</strong> It must. If your $QK$ product gives $d_k\times d_k$, you've transposed the wrong operand.</li>
+      </ol>
+      <p>Do those three and you literally never need to remember which world you're in. <strong>This is the general skill the shape questions are testing</strong> — not memorisation of one formula, but the discipline of letting dimensions constrain the algebra.</p>
+    </div>
+  </details>
+
   <h3>The full trap inventory</h3>
   <table>
     <tr><th>Trap</th><th>The rule</th><th>Block</th></tr>
@@ -1782,6 +1915,44 @@ print(round(sequence_prob(Y, [5,4,3,2,1,7]), 4))       # 0.0016</code></pre>
       <li><strong>Symbolic before numeric.</strong> The $\gamma=2\sigma$ question collapses to $H\beta$; the gradient-sum question collapses to 0; the $\sum c_t$ question collapses to $\sum_j\alpha_j\sum(h_j)$. The paper rewards seeing it.</li>
     </ul>
   </div>
+
+  <h3>From scratch — a convention detector</h3>
+<pre><code>def shape(M):
+    return (len(M), len(M[0]))
+
+def detect_world(X, d_model):
+    """Which axis of X is d_model? That answers everything else."""
+    r, c = shape(X)
+    if r == d_model and c != d_model:
+        return 'column', {'X': f'{d_model} x T', 'proj': 'Q = W_Q @ X',
+                          'W_Q': f'd_k x {d_model}', 'concat': 'vertical, W_O on left'}
+    if c == d_model and r != d_model:
+        return 'row',    {'X': f'T x {d_model}', 'proj': 'Q = X @ W_Q',
+                          'W_Q': f'{d_model} x d_k', 'concat': 'horizontal, W_O on right'}
+    return 'ambiguous — T == d_model, fall back to type-checking the product', {}
+
+# GA2's world: H is 3 x 3 with d_model = 3 -> ambiguous! (this is why GA2 says
+# "note that the embeddings are ROW vectors" explicitly. When T == d_model the
+# shapes CANNOT disambiguate and the question must tell you. Read that sentence.)
+print(detect_world([[0.5,0.25,1.0],[0.1,0.25,0.0],[0.1,0.1,0.9]], 3)[0])
+
+# The PYQ comprehension: X is 4 x 2, d_model = 4
+world, rules = detect_world([[1,0],[0,2],[1,0],[0,2]], 4)
+print(world)                 # column
+for k, v in rules.items():
+    print(' ', k, '->', v)
+
+def scores_typecheck(Q_shape, K_shape):
+    """The score matrix MUST be T x T. Try both and see which survives."""
+    out = []
+    if Q_shape[1] == K_shape[0]:  out.append(('Q @ K',    (Q_shape[0], K_shape[1])))
+    if Q_shape[1] == K_shape[1]:  out.append(('Q @ K.T',  (Q_shape[0], K_shape[0])))
+    if Q_shape[0] == K_shape[0]:  out.append(('Q.T @ K',  (Q_shape[1], K_shape[1])))
+    return out
+
+print(scores_typecheck((2,2), (2,2)))   # T == d_k == 2 here, so all three "work"
+                                        # -> when the toy numbers are square, only the
+                                        #    STATED formula settles it. Read the formula.</code></pre>
 
   <div class="prac">
     <span class="lbl">Practice 11.1 — the shape drill (do this cold, 90 seconds)</span>
